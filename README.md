@@ -2,13 +2,6 @@
 
 A Bayesian spatial regression exploring the effects of environmental stress on levels of agricultural landownership in affected regions. If you would only like to reproduce the analysis, use the provided R data object. If you wish to reproduce the dataset, follow the instructions below.
 
-## Running the Analysis
-
-
-More info to come.
-
-
-
 ## Reproducing the Dataset
 
 Reproducing the dataset requires manually downloading each of the prequisite datasets before running the code. Required data are as follows.
@@ -21,3 +14,8 @@ Reproducing the dataset requires manually downloading each of the prequisite dat
 
 4. Global percent-agricultural raster. Can also be retrieved from [ASAP](https://mars.jrc.ec.europa.eu/asap/download.php)
 
+Code for preparing the data is in `BuildDataset.R`. This script will process all primary data sources into the functional dataset used in the analysis. However, this script has not been debugged or rewritten in any way for replication. Data sources and file structures will have to be recreated. Please reach out to the author if you would like to use this script for replication purposes and find you are having issues.
+
+## Reproducing the Analysis
+
+All model code is contained in the `Analysis.Rmd` file. This file contains all code necessary to reproduce the analysis, including data preparation, model fitting, and posterior plot generation.

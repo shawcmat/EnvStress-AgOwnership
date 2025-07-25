@@ -1,0 +1,1293 @@
+---
+title: "Consolidated Land Ownership Model Analyses"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load Required Libraries.
+```{r setup, include=FALSE}
+# Load required libraries
+library(SpatialEpi)
+library(rgdal)
+library(leaflet)
+library(INLA)
+library(ggplot2)
+library(gridExtra)
+library(tidyverse)
+library(spdep)
+library(ggpubr)
+library(texreg)
+library(patchwork)
+library(lme4)
+library(spatialreg)
+library(sjPlot)
+library(texreg)
+
+```
+
+# Set Working Directory and create results folder. Define posterior plot generation functions.
+
+```{r data-prep}
+
+setwd("<Your data directory path here>")
+if (!dir.exists("model_results")) {
+    dir.create("model_results")
+}
+
+
+generate_plot1 <- function(posterior, interval1, interval2, title, fill1, fill2, linecolor, legendname){
+  
+  q10 <- inla.qmarginal(interval1, posterior)
+  q5 <- inla.qmarginal(interval2, posterior)
+  
+  plot <- ggplot(posterior, aes(x=x, y=y)) + geom_line() + ggtitle(title) + labs(x = expression(beta[1]), y = "Density") +
+    geom_area(data = subset(posterior, x > q10), aes(fill = fill1)) +
+    geom_area(data = subset(posterior, x > q5), aes(fill = fill2)) +
+    geom_vline(xintercept = 0, col = linecolor) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 12), legend.position = "bottom") +
+    scale_fill_identity(name = legendname, breaks = c(fill1, fill2), labels = c("10%", "5%"), guide = "legend")
+  
+  return(plot)
+  
+}
+
+generate_plot2 <- function(posterior, interval1, interval2, title, fill1, fill2, linecolor, legendname){
+  
+  q10 <- inla.qmarginal(interval1, posterior)
+  q5 <- inla.qmarginal(interval2, posterior)
+  
+  plot <- ggplot(posterior, aes(x=x, y=y)) + geom_line() + ggtitle(title) + labs(x = expression(beta[1]), y = "Density") +
+    geom_area(data = subset(posterior, x < q10), aes(fill = fill1)) +
+    geom_area(data = subset(posterior, x < q5), aes(fill = fill2)) +
+    geom_vline(xintercept = 0, col = linecolor) +
+    theme_bw() +
+    theme(plot.title = element_text(size= 12), legend.position = "bottom") +
+    scale_fill_identity(name = legendname, breaks = c(fill1, fill2), labels = c("10%", "5%"), guide = "legend")
+    
+  
+  return(plot)
+  
+}
+
+```
+
+# Generate descriptive statistics for our main variables.
+
+```{r desc-stats}
+
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+# Summary statistics for main variables
+A_landownership <- summary(A$HCAGONHLND)
+A_percent_crop  <- summary(A$percentcrop)
+A_spei03_minus05<- summary(A$SPEI03_Minus05)
+A_spei03_minus1 <- summary(A$SPEI03_Minus1)
+A_spei03_mean   <- summary(A$SPEI03_Mean)
+
+B_landownership <- summary(B$HCAGONHLND)
+B_percent_crop  <- summary(B$percentcrop)
+B_spei03_minus05<- summary(B$SPEI03_Minus05)
+B_spei03_minus1 <- summary(B$SPEI03_Minus1)
+B_spei03_mean   <- summary(B$SPEI03_Mean)
+
+Peru_landownership <- summary(Peru$HCAGONHLND)
+Peru_percent_crop  <- summary(Peru$percentcrop2)
+Peru_spei03_minus05<- summary(Peru$SPEI03_Minus05)
+Peru_spei03_minus1 <- summary(Peru$SPEI03_Minus1)
+Peru_spei03_mean   <- summary(Peru$SPEI03_Mean)
+
+destat_table <- rbind(A_landownership, 
+                      A_spei03_minus05,  
+                      A_spei03_minus1,
+                      A_spei03_mean,
+                      B_landownership, 
+                      B_spei03_minus05, 
+                      B_spei03_minus1,
+                      B_spei03_mean,
+                      Peru_landownership, 
+                      Peru_spei03_minus05, 
+                      Peru_spei03_minus1,
+                      Peru_spei03_mean)
+
+write.csv(destat_table, file = "./model_results/T2_descstats.csv")
+
+
+```
+
+# Part 1: INLA Models.
+
+The full list of tested models, and their resulting manuscript figure IDs are as follows:
+
+1. Primary result models.
+   - Land ownership = SPEI03 + percent cropland + Country + Year, tested with three SPEI03 treatments (Minus05, Minus1, Mean) and two datasets (A and B). (Manuscript figure 4.)
+2. Supplementary models.
+    - Replace 3 month SPEI with a 12 month SEPI. (Manuscript supplementary figure S1)
+    - Include the previous survey data as an expected value in the INLA approximation. (Manuscript supplementary figure S2)
+    - Peru only analysis. (Manuscript supplementary figure S3)
+    - Null model for comparison, where we remove the percent cropland and both country and year fixed effects. (Manuscript supplementary figure S8)
+    - Comparitve models using a continuous year variable instead of a factor. (Manuscript supplementary figure S9).
+3. Additional tested models.
+    - Predicting change in land ownership from previous survey year directly.
+    - Including DHSREGION as an additional fixed effect.
+    - Including an interaction term between SPEI03 and percent cropland.
+
+
+## 1.1: Primary result figure models.
+```{r Primary result model}
+
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+# Models A1, A2, A3 (Full Sample, no Peru, with year fixed effect)
+
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+A$re_u <- seq_len(nrow(A))
+A$re_v <- seq_len(nrow(A))
+
+fA1 <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2 <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3 <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1 <- inla(fA1, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2 <- inla(fA2, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3 <- inla(fA3, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+# Models B1, B2, B3 (Only new countries, no Peru, with year fixed effect)
+
+nb <- poly2nb(B)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+B$re_u <- 1:nrow(B)
+B$re_v <- 1:nrow(B)
+
+fB1 <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB2 <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB3 <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mB1 <- inla(fB1, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB2 <- inla(fB2, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB3 <- inla(fB3, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+# Generating figure 4 - Primary Results Figure.
+
+q <- 0
+
+post_A1 <- data.frame(inla.smarginal(mA1$marginals.fixed$SPEI03_Minus05))
+post_A2 <- data.frame(inla.smarginal(mA2$marginals.fixed$SPEI03_Minus1))
+post_A3 <- data.frame(inla.smarginal(mA3$marginals.fixed$SPEI03_Mean))
+
+post_B1 <- data.frame(inla.smarginal(mB1$marginals.fixed$SPEI03_Minus05))
+post_B2 <- data.frame(inla.smarginal(mB2$marginals.fixed$SPEI03_Minus1))
+post_B3 <- data.frame(inla.smarginal(mB3$marginals.fixed$SPEI03_Mean))
+
+p_A1 <- inla.pmarginal(0, post_A1) #
+p_A2 <- inla.pmarginal(0, post_A2) #
+p_A3 <- inla.pmarginal(0, post_A3) #
+
+p_B1 <- inla.pmarginal(0, post_B1) #
+p_B2 <- inla.pmarginal(0, post_B2) #
+p_B3 <- inla.pmarginal(0, post_B3) #
+
+A1_plot <- generate_plot1(post_A1, .95, .975, "Model 1A: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+A2_plot <- generate_plot1(post_A2, .95, .975, "Model 2A: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+A3_plot <- generate_plot2(post_A3, .05, .025, "Model 3A: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+B1_plot <- generate_plot1(post_B1, .95, .975, "Model 1B: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+B2_plot <- generate_plot1(post_B2, .95, .975, "Model 2B: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+B3_plot <- generate_plot2(post_B3, .05, .025, "Model 3B: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+titleA <- "A)"
+titleB <- "B)"
+
+titleA <- text_grob(titleA, size = 12, face = "bold")
+titleB <- text_grob(titleB, size = 12, face = "bold")
+
+titleA <- as_ggplot(titleA) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+titleB <- as_ggplot(titleB) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+
+
+f4 <- titleA / 
+      (A1_plot | A2_plot | A3_plot) / 
+      titleB / 
+      (B1_plot | B2_plot | B3_plot) /
+      guide_area() + plot_layout(heights = c(2,5,2,5,1), guides = "collect")
+
+
+ggsave('f4_INLAposteriors.png', plot = f4, path = "./model_results", 
+       width = 11.5, height = 8, units = "in", dpi = "print")
+
+
+results_table <- data.frame(SPEI0305 = c(p_A1, p_B1), SPEI031 = c(p_A2, p_B2), SPEI03Mean = c(p_A3, p_B3), 
+                            row.names = (c("FullSample", "NewCountries")))
+
+write.csv(results_table, file = "./model_results/INLA_probTable.csv")
+
+```
+
+## 1.2: Supplementary figure models.
+
+### Using SPEI12 instead of SPEI03. Supplementary figure S1.
+```{r SPEI12-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+# Models A1, A2, A3 (Full Sample, no Peru, with year fixed effect)
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+A$re_u <- 1:nrow(A)
+A$re_v <- 1:nrow(A)
+
+fA1 <-  HCAGONHLND ~ SPEI12_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2 <-  HCAGONHLND ~ SPEI12_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3 <-  HCAGONHLND ~ SPEI12_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1 <- inla(fA1, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2 <- inla(fA2, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3 <- inla(fA3, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+#Models B1, B2, B3 (Only new countries, no Peru, with year fixed effect)
+
+nb <- poly2nb(B)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+B$re_u <- 1:nrow(B)
+B$re_v <- 1:nrow(B)
+
+fB1 <-  HCAGONHLND ~ SPEI12_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB2 <-  HCAGONHLND ~ SPEI12_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB3 <-  HCAGONHLND ~ SPEI12_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mB1 <- inla(fB1, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB2 <- inla(fB2, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB3 <- inla(fB3, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+# Figure S1
+
+q <- 0
+
+post_A1 <- data.frame(inla.smarginal(mA1$marginals.fixed$SPEI12_Minus05))
+post_A2 <- data.frame(inla.smarginal(mA2$marginals.fixed$SPEI12_Minus1))
+post_A3 <- data.frame(inla.smarginal(mA3$marginals.fixed$SPEI12_Mean))
+post_B1 <- data.frame(inla.smarginal(mB1$marginals.fixed$SPEI12_Minus05))
+post_B2 <- data.frame(inla.smarginal(mB2$marginals.fixed$SPEI12_Minus1))
+post_B3 <- data.frame(inla.smarginal(mB3$marginals.fixed$SPEI12_Mean))
+
+p_A1 <- inla.pmarginal(0, post_A1)
+p_A2 <- inla.pmarginal(0, post_A2)
+p_A3 <- inla.pmarginal(0, post_A3)
+p_B1 <- inla.pmarginal(0, post_B1)
+p_B2 <- inla.pmarginal(0, post_B2)
+p_B3 <- inla.pmarginal(0, post_B3)
+
+A1_plot <- generate_plot1(post_A1, .95, .975, "Model 1A: SPEI12 < -0.5", "blue", "black", "red", "C.I")
+A2_plot <- generate_plot1(post_A2, .95, .975, "Model 2A: SPEI12 < -1.0", "blue", "black", "red", "C.I")
+A3_plot <- generate_plot2(post_A3, .05, .025, "Model 3A: SPEI12 Mean", "blue", "black", "red", "C.I")
+
+B1_plot <- generate_plot1(post_B1, .95, .975, "Model 1B: SPEI12 < -0.5", "blue", "black", "red", "C.I")
+B2_plot <- generate_plot1(post_B2, .95, .975, "Model 2B: SPEI12 < -1.0", "blue", "black", "red", "C.I")
+B3_plot <- generate_plot2(post_B3, .05, .025, "Model 3B: SPEI12 Mean", "blue", "black", "red", "C.I")
+
+titleA <- "A)"
+titleB <- "B)"
+
+titleA <- text_grob(titleA, size = 12, face = "bold")
+titleB <- text_grob(titleB, size = 12, face = "bold")
+
+titleA <- as_ggplot(titleA) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+titleB <- as_ggplot(titleB) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+
+s1 <- titleA / 
+  (A1_plot | A2_plot | A3_plot) / 
+  titleB / 
+  (B1_plot | B2_plot | B3_plot) /
+  guide_area() + plot_layout(heights = c(2,5,2,5,1), guides = "collect")
+
+ggsave('s1_INLA_SPEI12.png', plot = s1, path = "./model_results/", 
+       width = 11.5, height = 8, units = "in", dpi = "print")
+
+```
+
+### Previous survey data as expected value. Supplementary figure S2.
+```{r previous-survey-model}
+
+# Change calculation
+load("FullDataAfrica.RData") #Full set (Including Africa)
+A <- LandData
+A <- subset(A, CNTRYNAMEE != "Peru")
+rm(LandData)
+A <- as.data.frame(A)
+
+A$LandOwnChange = NA
+
+countrylist <- unique(A$CNTRYNAMEE)
+
+AllUnitsComplete <- data.frame(matrix(ncol = (ncol(A))))
+
+for(cntry in countrylist){
+  
+  workingcountry <- subset(A, CNTRYNAMEE == cntry)
+  
+  unitlist <- unique(workingcountry$DHSREGEN)
+  
+  for(unt in unitlist){
+    
+    workingunit <- subset(workingcountry, DHSREGEN == unt)
+    
+    yearlist <- workingunit$SVYYEAR
+    
+    ownershiplist <- workingunit$HCAGONHLND
+    
+    reftable <- data.frame(yearlist, ownershiplist)
+    
+    reftable <- arrange(reftable, yearlist)
+    
+    if(length(yearlist) > 1){
+      
+      print(paste0(paste0("Multiple Years Available in ", cntry, sep = "_"), unt))
+      
+      for(row in 1:nrow(workingunit)){
+        
+        print(paste("check on row" , as.character(row)))
+        
+        rowyear <- workingunit[row, "SVYYEAR"]
+        
+        rowownership <- workingunit[row, "HCAGONHLND"]
+        
+        if(rowyear != min(yearlist)){
+          
+          for(refrow in 1:nrow(reftable)){
+            
+            if(rowyear == reftable[refrow,"yearlist"]){
+              
+              print(paste("refrow ", as.character(refrow)))
+              
+              workingunit[row, "LandOwnChange"] <- reftable[refrow, "ownershiplist"] - reftable[ refrow-1, "ownershiplist"]
+              
+            }
+            
+          }
+          
+        }
+        
+      }
+      
+    }
+    
+    names(AllUnitsComplete) <- names(workingunit)
+    
+    AllUnitsComplete <- rbind(AllUnitsComplete, workingunit)
+    
+    print(dim(AllUnitsComplete))
+    
+  }
+  
+}
+
+AllUnitsComplete <- drop_na(AllUnitsComplete, CNTRYNAMEE)
+
+AllUnitsComplete <- st_sf(AllUnitsComplete)
+
+print(names(AllUnitsComplete))
+
+print(dim(AllUnitsComplete))
+
+A <- AllUnitsComplete
+
+A <- drop_na(A, LandOwnChange) # Full "PercentChange" dataset.
+
+A$expected <- A$HCAGONHLND - A$LandOwnChange
+
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+# Actual modeling is here.
+
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+expected <- A$expected
+
+A$re_u <- 1:nrow(A)
+A$re_v <- 1:nrow(A)
+
+fA1 <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2 <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3 <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1 <- inla(fA1, family = "gaussian", data = A, E = expected, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2 <- inla(fA2, family = "gaussian", data = A, E = expected, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3 <- inla(fA3, family = "gaussian", data = A, E = expected, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+q <- 0
+
+post_A1 <- data.frame(inla.smarginal(mA1$marginals.fixed$SPEI03_Minus05))
+post_A2 <- data.frame(inla.smarginal(mA2$marginals.fixed$SPEI03_Minus1))
+post_A3 <- data.frame(inla.smarginal(mA3$marginals.fixed$SPEI03_Mean))
+
+p_A1 <- inla.pmarginal(0, post_A1) #
+p_A2 <- inla.pmarginal(0, post_A2) #
+p_A3 <- inla.pmarginal(0, post_A3) #
+
+A1_plot <- generate_plot1(post_A1, .95, .975, "Model 1: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+A2_plot <- generate_plot1(post_A2, .95, .975, "Model 2: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+A3_plot <- generate_plot2(post_A3, .05, .025, "Model 3: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+
+titleA <- "With prior survey as the expected value. (Only includes units with multiple survey years.)"
+
+titleA <- text_grob(titleA, size = 12, face = "bold")
+
+titleA <- as_ggplot(titleA) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+
+
+s2 <- (A1_plot | A2_plot | A3_plot) /
+      guide_area() + plot_layout(heights = c(5,1), guides = "collect")
+
+
+ggsave('s2_INLA_expected.png', plot = s2, path = "./model_results/", 
+       width = 11.5, height = 3.5, units = "in", dpi = "print")
+
+
+```
+
+### Peru only analysis. Supplementary figure S3.
+```{r peru-only-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+E <- Peru
+
+nb <- poly2nb(E)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+E$re_u <- 1:nrow(E)
+E$re_v <- 1:nrow(E)
+
+fE1 <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fE2 <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fE3 <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mE1 <- inla(fE1, family = "gaussian", data = E, control.predictor = list(compute = TRUE), verbose = TRUE)
+mE2 <- inla(fE2, family = "gaussian", data = E, control.predictor = list(compute = TRUE), verbose = TRUE)
+mE3 <- inla(fE3, family = "gaussian", data = E, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+
+# Figure S3
+
+q <- 0
+
+post_E1 <- data.frame(inla.smarginal(mE1$marginals.fixed$SPEI03_Minus05))
+post_E2 <- data.frame(inla.smarginal(mE2$marginals.fixed$SPEI03_Minus1))
+post_E3 <- data.frame(inla.smarginal(mE3$marginals.fixed$SPEI03_Mean))
+
+p_E1 <- inla.pmarginal(0, post_E1) #
+p_E2 <- inla.pmarginal(0, post_E2) #
+p_E3 <- inla.pmarginal(0, post_E3) #
+
+E1_plot <- generate_plot1(post_E1, .95, .975, "Model 1: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+E2_plot <- generate_plot1(post_E2, .95, .975, "Model 2: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+E3_plot <- generate_plot2(post_E3, .05, .025, "Model 3: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+titleE <- "Peru Only"
+
+titleE <- text_grob(titleE, size = 12, face = "bold")
+
+titleE <- as_ggplot(titleE) + theme(plot.margin = margin(-0.5,0,-0.5,0, "cm"))
+
+
+f4 <- titleE /
+  (E1_plot | E2_plot | E3_plot) /
+  guide_area() + plot_layout(heights = c(2,5,1), guides = "collect")
+
+
+ggsave('S3_INLA_Peru.png', plot = f4, path = "./model_results/", 
+       width = 11.5, height = 3.5, units = "in", dpi = "print")
+
+
+```
+
+### Null model. Supplementary figure S8.
+```{r null-model}
+
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+rev_fA1_null <-  HCAGONHLND ~ SPEI03_Minus05 + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+rev_fA2_null <-  HCAGONHLND ~ SPEI03_Minus1 + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+rev_fA3_null <-  HCAGONHLND ~ SPEI03_Mean  + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+rev_mA1_null <- inla(rev_fA1_null, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+rev_mA2_null <- inla(rev_fA2_null, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+rev_mA3_null <- inla(rev_fA3_null, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+summary(rev_mA1_null)
+summary(rev_mA2_null)
+summary(rev_mA3_null)
+
+# Generating supplementary figure S8 - Null Model.
+
+rev_post_A1 <- data.frame(inla.smarginal(rev_mA1_null$marginals.fixed$SPEI03_Minus05))
+rev_post_A2 <- data.frame(inla.smarginal(rev_mA2_null$marginals.fixed$SPEI03_Minus1))
+rev_post_A3 <- data.frame(inla.smarginal(rev_mA3_null$marginals.fixed$SPEI03_Mean))
+
+rev_p_A1 <- inla.pmarginal(0, rev_post_A1) #
+rev_p_A2 <- inla.pmarginal(0, rev_post_A2) #
+rev_p_A3 <- inla.pmarginal(0, rev_post_A3) #
+
+A1_plot_rev_null <- generate_plot1(rev_post_A1, .95, .975, "Model 1: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+A2_plot_rev_null <- generate_plot1(rev_post_A2, .95, .975, "Model 2: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+A3_plot_rev_null <- generate_plot2(rev_post_A3, .05, .025, "Model 3: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+f4_rev<-
+  (A1_plot_rev_null|A2_plot_rev_null|A3_plot_rev_null)/
+  guide_area() + plot_layout(heights = c(5,1), guides = "collect")
+
+ggsave('s8_nullmodel.png', plot = f4_rev, path = "./model_results/", 
+       width = 11.5, height = 3.5, units = "in", dpi = "print")
+
+
+```
+
+### Continuous year variable. Supplementary figure S9.
+```{r continuous-year-model}
+
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+class(A$SVYYEAR)
+A$year_num<-as.integer(factor(A$SVYYEAR,unique(A$SVYYEAR)))
+summary(A$year_num)
+num_fA1 <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + year_num + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+num_fA2 <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + year_num + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+num_fA3 <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + year_num + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+num_mA1 <- inla(num_fA1, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+num_mA2 <- inla(num_fA2, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+num_mA3 <- inla(num_fA3, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+summary(num_mA1)
+summary(num_mA2)
+summary(num_mA3)
+
+num_post_A1 <- data.frame(inla.smarginal(num_mA1$marginals.fixed$SPEI03_Minus05))
+num_post_A2 <- data.frame(inla.smarginal(num_mA2$marginals.fixed$SPEI03_Minus1))
+num_post_A3 <- data.frame(inla.smarginal(num_mA3$marginals.fixed$SPEI03_Mean))
+
+num_p_A1 <- inla.pmarginal(0, num_post_A1) #
+num_p_A2 <- inla.pmarginal(0, num_post_A2) #
+num_p_A3 <- inla.pmarginal(0, num_post_A3) #
+
+A1_plot_num <- generate_plot1(num_post_A1, .95, .975, "Model 1: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+A2_plot_num <- generate_plot1(num_post_A2, .95, .975, "Model 2: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+A3_plot_num <- generate_plot2(num_post_A3, .05, .025, "Model 3: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+f4_num<-
+  (A1_plot_num|A2_plot_num|A3_plot_num)/
+  guide_area() + plot_layout(heights = c(5,1), guides = "collect")
+
+ggsave('s9_num.png', plot = f4_num, path = "./model_results/", 
+       width = 11.5, height = 3.5, units = "in", dpi = "print")
+
+
+```
+
+## 1.3: Additional tested models.
+
+### Predicting change in land ownership from previous survey year directly.
+```{r change-predict-model}
+
+
+# Change calculation
+load("FullDataAfrica.RData") #Full set (Including Africa)
+A <- LandData
+A <- subset(A, CNTRYNAMEE != "Peru")
+rm(LandData)
+A <- as.data.frame(A)
+
+A$LandOwnChange = NA
+
+countrylist <- unique(A$CNTRYNAMEE)
+
+AllUnitsComplete <- data.frame(matrix(ncol = (ncol(A))))
+
+for(cntry in countrylist){
+  
+  workingcountry <- subset(A, CNTRYNAMEE == cntry)
+  
+  unitlist <- unique(workingcountry$DHSREGEN)
+  
+  for(unt in unitlist){
+    
+    workingunit <- subset(workingcountry, DHSREGEN == unt)
+    
+    yearlist <- workingunit$SVYYEAR
+    
+    ownershiplist <- workingunit$HCAGONHLND
+    
+    reftable <- data.frame(yearlist, ownershiplist)
+    
+    reftable <- arrange(reftable, yearlist)
+    
+    if(length(yearlist) > 1){
+      
+      print(paste0(paste0("Multiple Years Available in ", cntry, sep = "_"), unt))
+      
+      for(row in 1:nrow(workingunit)){
+        
+        print(paste("check on row" , as.character(row)))
+        
+        rowyear <- workingunit[row, "SVYYEAR"]
+        
+        rowownership <- workingunit[row, "HCAGONHLND"]
+        
+        if(rowyear != min(yearlist)){
+          
+          for(refrow in 1:nrow(reftable)){
+            
+            if(rowyear == reftable[refrow,"yearlist"]){
+              
+              print(paste("refrow ", as.character(refrow)))
+              
+              workingunit[row, "LandOwnChange"] <- reftable[refrow, "ownershiplist"] - reftable[ refrow-1, "ownershiplist"]
+              
+            }
+            
+          }
+          
+        }
+        
+      }
+      
+    }
+    
+    names(AllUnitsComplete) <- names(workingunit)
+    
+    AllUnitsComplete <- rbind(AllUnitsComplete, workingunit)
+    
+    print(dim(AllUnitsComplete))
+    
+  }
+  
+}
+
+AllUnitsComplete <- drop_na(AllUnitsComplete, CNTRYNAMEE)
+
+AllUnitsComplete <- st_sf(AllUnitsComplete)
+
+print(names(AllUnitsComplete))
+
+print(dim(AllUnitsComplete))
+
+A <- AllUnitsComplete
+
+A <- drop_na(A, LandOwnChange) # Full "PercentChange" dataset.
+
+A$expected <- A$HCAGONHLND - A$LandOwnChange
+
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+# Actual modeling is here.
+
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+expected <- A$expected
+
+A$re_u <- 1:nrow(A)
+A$re_v <- 1:nrow(A)
+
+fA1_ch <-  LandOwnChange ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2_ch <-  LandOwnChange ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3_ch <-  LandOwnChange ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1_ch <- inla(fA1_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2_ch <- inla(fA2_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3_ch <- inla(fA3_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+post_A1_ch <- data.frame(inla.smarginal(mA1_ch$marginals.fixed$SPEI03_Minus05))
+post_A2_ch <- data.frame(inla.smarginal(mA2_ch$marginals.fixed$SPEI03_Minus1))
+post_A3_ch <- data.frame(inla.smarginal(mA3_ch$marginals.fixed$SPEI03_Mean))
+p_A1_ch <- inla.pmarginal(0, post_A1_ch) #
+p_A2_ch <- inla.pmarginal(0, post_A2_ch) #
+p_A3_ch <- inla.pmarginal(0, post_A3_ch) #
+
+titleA_ch <- ""
+
+titleA_ch <- text_grob(titleA_ch, size = 12, face = "bold")
+titleA_ch <- as_ggplot(titleA_ch) 
+
+f4_ch <- titleA_ch /
+  (A1_ch_plot | A2_ch_plot | A3_ch_plot) /
+  guide_area() 
+
+
+ggsave('PredictingChange_results.png', plot = f4_ch, path = "./model_results/", 
+       width = 11.5, height = 3, units = "in", dpi = "print")
+
+
+```
+
+### Including DHSREGION as an additional fixed effect.
+```{r DHSREGION-model}
+load("FullDataAfrica.RData") #Full set (Including Africa)
+A <- LandData
+A <- subset(A, CNTRYNAMEE != "Peru")
+rm(LandData)
+A <- as.data.frame(A)
+
+A$LandOwnChange = NA
+
+countrylist <- unique(A$CNTRYNAMEE)
+
+AllUnitsComplete <- data.frame(matrix(ncol = (ncol(A))))
+
+for(cntry in countrylist){
+  
+  workingcountry <- subset(A, CNTRYNAMEE == cntry)
+  
+  unitlist <- unique(workingcountry$DHSREGEN)
+  
+  for(unt in unitlist){
+    
+    workingunit <- subset(workingcountry, DHSREGEN == unt)
+    
+    yearlist <- workingunit$SVYYEAR
+    
+    ownershiplist <- workingunit$HCAGONHLND
+    
+    reftable <- data.frame(yearlist, ownershiplist)
+    
+    reftable <- arrange(reftable, yearlist)
+    
+    if(length(yearlist) > 1){
+      
+      print(paste0(paste0("Multiple Years Available in ", cntry, sep = "_"), unt))
+      
+      for(row in 1:nrow(workingunit)){
+        
+        print(paste("check on row" , as.character(row)))
+        
+        rowyear <- workingunit[row, "SVYYEAR"]
+        
+        rowownership <- workingunit[row, "HCAGONHLND"]
+        
+        if(rowyear != min(yearlist)){
+          
+          for(refrow in 1:nrow(reftable)){
+            
+            if(rowyear == reftable[refrow,"yearlist"]){
+              
+              print(paste("refrow ", as.character(refrow)))
+              
+              workingunit[row, "LandOwnChange"] <- reftable[refrow, "ownershiplist"] - reftable[ refrow-1, "ownershiplist"]
+              
+            }
+            
+          }
+          
+        }
+        
+      }
+      
+    }
+    
+    names(AllUnitsComplete) <- names(workingunit)
+    
+    AllUnitsComplete <- rbind(AllUnitsComplete, workingunit)
+    
+    print(dim(AllUnitsComplete))
+    
+  }
+  
+}
+
+AllUnitsComplete <- drop_na(AllUnitsComplete, CNTRYNAMEE)
+
+AllUnitsComplete <- st_sf(AllUnitsComplete)
+
+print(names(AllUnitsComplete))
+
+print(dim(AllUnitsComplete))
+
+A <- AllUnitsComplete
+
+A <- drop_na(A, LandOwnChange) # Full "PercentChange" dataset.
+
+A$expected <- A$HCAGONHLND - A$LandOwnChange
+
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+# Actual modeling is here.
+
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+expected <- A$expected
+
+A$re_u <- 1:nrow(A)
+A$re_v <- 1:nrow(A)
+
+fA1_ch <-  HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR + DHSREGEN + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2_ch <-  HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR + DHSREGEN + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3_ch <-  HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR + DHSREGEN + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1_ch <- inla(fA1_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2_ch <- inla(fA2_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3_ch <- inla(fA3_ch, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+post_A1_ch <- data.frame(inla.smarginal(mA1_ch$marginals.fixed$SPEI03_Minus05))
+post_A2_ch <- data.frame(inla.smarginal(mA2_ch$marginals.fixed$SPEI03_Minus1))
+post_A3_ch <- data.frame(inla.smarginal(mA3_ch$marginals.fixed$SPEI03_Mean))
+
+p_A1_ch <- inla.pmarginal(0, post_A1_ch) #
+p_A2_ch <- inla.pmarginal(0, post_A2_ch) #
+p_A3_ch <- inla.pmarginal(0, post_A3_ch) #
+
+A1_ch_plot <- generate_plot1(post_A1_ch, .95, .975, "Model 1: SPEI03 < -0.5", "blue", "black", "red", "C.I")
+A2_ch_plot <- generate_plot1(post_A2_ch, .95, .975, "Model 2: SPEI03 < -1.0", "blue", "black", "red", "C.I")
+A3_ch_plot <- generate_plot2(post_A3_ch, .05, .025, "Model 3: SPEI03 Mean", "blue", "black", "red", "C.I")
+
+
+titleA_ch <- ""
+
+titleA_ch <- text_grob(titleA_ch, size = 12, face = "bold")
+titleA_ch <- as_ggplot(titleA_ch) 
+
+f4_ch <- titleA_ch /
+  (A1_ch_plot | A2_ch_plot | A3_ch_plot) /
+  guide_area() 
+
+
+ggsave('Including_DHSRegion_FixedEffect.png', plot = f4_ch, path = "./model_results/", 
+       width = 11.5, height = 3, units = "in", dpi = "print")
+
+
+```
+
+### Including an interaction term between SPEI and percent crop.
+```{r interaction-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+nb <- poly2nb(A)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+A$re_u <- 1:nrow(A)
+A$re_v <- 1:nrow(A)
+
+fA1_int <-  HCAGONHLND ~ SPEI03_Minus05 * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA2_int <-  HCAGONHLND ~ SPEI03_Minus1 * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fA3_int <-  HCAGONHLND ~ SPEI03_Mean * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mA1_int <- inla(fA1_int, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA2_int <- inla(fA2_int, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+mA3_int <- inla(fA3_int, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+post_A1_int <- data.frame(inla.smarginal(mA1_int$marginals.fixed$'SPEI03_Minus05:percentcrop'))
+post_A2_int <- data.frame(inla.smarginal(mA2_int$marginals.fixed$'SPEI03_Minus1:percentcrop'))
+post_A3_int <- data.frame(inla.smarginal(mA3_int$marginals.fixed$'SPEI03_Mean:percentcrop'))
+
+p_A1_int <- inla.pmarginal(0, post_A1_int) #
+p_A2_int <- inla.pmarginal(0, post_A2_int) #
+p_A3_int <- inla.pmarginal(0, post_A3_int) #
+
+r <- inla(fA1_int, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = T)
+lc_v2 = inla.make.lincombs(
+  percentcrop = r$model.matrix[,"percentcrop"],
+  "SPEI03_Minus05:percentcrop" = r$model.matrix[,"SPEI03_Minus05:percentcrop"])
+
+rr_v2 <- inla(fA1_int, family = "gaussian", data = A, control.predictor = list(compute = TRUE), verbose = T, lincomb = lc_v2)
+
+rr$summary.lincomb.derived
+rr$marginals.lincomb.derived
+
+fA1_lm <-  lm(HCAGONHLND ~ SPEI03_Minus05 * percentcrop + CNTRYNAMEE + SVYYEAR,data = A)
+fA2_lm <-  lm(HCAGONHLND ~ SPEI03_Minus1 * percentcrop + CNTRYNAMEE + SVYYEAR,data = A)
+fA3_lm <-  lm(HCAGONHLND ~ SPEI03_Mean * percentcrop + CNTRYNAMEE + SVYYEAR,data = A)
+
+plot_model(fA1_lm, type = "pred", terms = "SPEI03_Minus05")
+
+plot_model(fA3_lm, type = "pred", terms = c("SPEI03_Mean","percentcrop"))
+
+png("model_results/interaction_plot_A.png", 5, 5, units = "in", res = 300)
+plot_model(fA3_lm, type = "pred", terms = c("SPEI03_Mean","percentcrop"))
+dev.off()
+
+nb <- poly2nb(B)
+head(nb)
+
+nb2INLA("map.adj", nb)
+
+g <- inla.read.graph(filename = "map.adj")
+
+B$re_u <- 1:nrow(B)
+B$re_v <- 1:nrow(B)
+
+fB1_int <-  HCAGONHLND ~ SPEI03_Minus05 * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB2_int <-  HCAGONHLND ~ SPEI03_Minus1 * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+fB3_int <-  HCAGONHLND ~ SPEI03_Mean * percentcrop + CNTRYNAMEE + SVYYEAR + f(re_u, model = "besag", graph = g, scale.model = TRUE) + f(re_v, model = "iid")
+
+mB1_int <- inla(fB1_int, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB2_int <- inla(fB2_int, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+mB3_int <- inla(fB3_int, family = "gaussian", data = B, control.predictor = list(compute = TRUE), verbose = TRUE)
+
+post_B1_int <- data.frame(inla.smarginal(mB1_int$marginals.fixed$'SPEI03_Minus05:percentcrop'))
+post_B2_int <- data.frame(inla.smarginal(mB2_int$marginals.fixed$'SPEI03_Minus1:percentcrop'))
+post_B3_int <- data.frame(inla.smarginal(mB3_int$marginals.fixed$'SPEI03_Mean:percentcrop'))
+
+p_B1_int <- inla.pmarginal(0, post_B1_int) #
+p_B2_int <- inla.pmarginal(0, post_B2_int) #
+p_B3_int <- inla.pmarginal(0, post_B3_int) #
+
+#interpreting the effects for a binary variable = effect of the continuous variable in one condition compared to another (add them together)
+# so for example, we'd say for model1B_int that
+# for every additional percent crop, landownership changes 0.029
+# in the interaction term with spei below -.5, when percent crop goes up, landownership changes -0.007
+# add those together and 0.029 + -0.007 is a reduction in landownership with percent crop rising. 
+
+#https://www.theanalysisfactor.com/interactions-categorical-and-continuous-variables/
+
+# for the continuous variables, centering on the mean just means for an average percent cropland, the effect of SPEI is that basic SPEI coefficient
+
+```
+
+# Part 2: Linear Regression models
+
+For this section, the models are as follows:
+
+1. Primary results models.
+    - Mixed effect spatial filter model. Manuscript table T1.
+
+2. Supplementary models. 
+    - Baseline model. Manuscript table ST1.
+    - Baseline model with spatial filter. Manuscript table ST2.
+
+## Primary results model.
+### Mixed effect spatial filter model. Manuscript table T1.
+```{r primary-ME-SF-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+nbA <- poly2nb(A, queen = TRUE)
+lwA <- nb2listw(nbA, zero.policy = TRUE)
+nbB <- poly2nb(B, queen = TRUE)
+lwB <- nb2listw(nbB, zero.policy = TRUE)
+
+m1A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus05 , data = A, nb=nbA, style="W", zero.policy =T)
+m2A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus1 , data = A, nb=nbA, style="W", zero.policy =T)
+m3A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Mean, data = A, nb=nbA, style="W", zero.policy =T)
+m1B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus05 , data = B, nb=nbB, style="W", zero.policy =T)
+m2B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus1 , data = B, nb=nbB, style="W", zero.policy =T)
+m3B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Mean, data = B, nb=nbB, style="W", zero.policy =T)
+
+lme1A <- lmer(HCAGONHLND ~ SPEI03_Minus05 + percentcrop + SVYYEAR + fitted(m1A_eigenvectors) + (1+SPEI03_Minus05|CNTRYNAMEE), data = A)
+lme2A <- lmer(HCAGONHLND ~ SPEI03_Minus1 + percentcrop + SVYYEAR + fitted(m2A_eigenvectors) + (1+SPEI03_Minus1|CNTRYNAMEE), data = A)
+lme3A <- lmer(HCAGONHLND ~ SPEI03_Mean + percentcrop + SVYYEAR + fitted(m3A_eigenvectors) + (1+SPEI03_Mean|CNTRYNAMEE), data = A)
+
+lme1B <- lmer(HCAGONHLND ~ SPEI03_Minus05 + percentcrop + SVYYEAR + fitted(m1B_eigenvectors) + (1+SPEI03_Minus05|CNTRYNAMEE), data = B)
+lme2B <- lmer(HCAGONHLND ~ SPEI03_Minus1 + percentcrop + SVYYEAR + fitted(m2B_eigenvectors) + (1+SPEI03_Minus1|CNTRYNAMEE), data = B)
+lme3B <- lmer(HCAGONHLND ~ SPEI03_Mean + percentcrop +  SVYYEAR + fitted(m3B_eigenvectors) + (1+SPEI03_Mean|CNTRYNAMEE), data = B)
+
+#Make table panel A
+
+htmlreg(list(lme1A, lme2A, lme3A),
+        file = "./model_results/t1_A.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1A","Model 2A","Model 3A"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2", 
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Spatial filter mixed effects model of effects of growing season SPEI03 during preceding five-year period. (Full Sample.)",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+#Make table panel B
+
+htmlreg(list(lme1B, lme2B, lme3B),
+        file = "./model_results/t1_B.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1B","Model 2B","Model 3B"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2", 
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Spatial filter mixed effects model of effects of growing season SPEI03 during preceding five-year period. (15 Countries.)",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+```
+
+## Supplementary models.
+### Baseline model. Manuscript table ST1.
+```{r baseline-OLS-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+
+m1A <-lm(HCAGONHLND ~ SPEI03_Minus05 + percentcrop + CNTRYNAMEE + SVYYEAR, data = C)
+m2A <-lm(HCAGONHLND ~ SPEI03_Minus1 + percentcrop + CNTRYNAMEE + SVYYEAR, data = C)
+m3A <-lm(HCAGONHLND ~ SPEI03_Mean + percentcrop + CNTRYNAMEE + SVYYEAR, data = C)
+
+m1B <-lm(HCAGONHLND ~ SPEI03_Minus05 + percentcrop2 + CNTRYNAMEE + SVYYEAR, data = D)
+m2B <-lm(HCAGONHLND ~ SPEI03_Minus1 + percentcrop2 + CNTRYNAMEE + SVYYEAR, data = D)
+m3B <-lm(HCAGONHLND ~ SPEI03_Mean + percentcrop2 + CNTRYNAMEE + SVYYEAR, data = D)
+
+
+
+#Make table panel A.
+
+htmlreg(list(m1A, m2A, m3A),
+        file = "./model_results/ts1_A.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1a","Model 2a","Model 3a"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2",
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Baseline OLS effects of growing-season SPEI03 during preceding five-year period. (Full sample.)",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+#Make table panel B.
+
+htmlreg(list(m1B, m2B, m3B),
+        file = "./model_results/ts1_B.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1B","Model 2B","Model 3B"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2",
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Baseline OLS effects of growing-season SPEI03 during preceding five-year period. (15 countries.)",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+
+```
+
+### Baseline model with spatial filter. Manuscript table ST2.
+```{r baseline-SF-model}
+# Load datasets
+load("FullDataAfrica.RData")
+A <- LandData
+A$CNTRYNAMEE <- as.factor(A$CNTRYNAMEE)
+A$SVYYEAR <- as.factor(A$SVYYEAR)
+A <- subset(A, CNTRYNAMEE != "Peru")
+
+load("MainDataV6.RData")
+B <- subset(LandData, CNTRYNAMEE != "Peru")
+B$CNTRYNAMEE <- as.factor(B$CNTRYNAMEE)
+B$SVYYEAR <- as.factor(B$SVYYEAR)
+Peru <- subset(LandData, CNTRYNAMEE == "Peru")
+rm(LandData)
+
+nbA <- poly2nb(A, queen = TRUE)
+lwA <- nb2listw(nbA, zero.policy = TRUE)
+nbB <- poly2nb(B, queen = TRUE)
+lwB <- nb2listw(nbB, zero.policy = TRUE)
+
+m1A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus05 , data = A, nb=nbA, style="W", zero.policy =T)
+m2A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus1 , data = A, nb=nbA, style="W", zero.policy =T)
+m3A_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Mean, data = A, nb=nbA, style="W", zero.policy =T)
+m1B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus05 , data = B, nb=nbB, style="W", zero.policy =T)
+m2B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Minus1 , data = B, nb=nbB, style="W", zero.policy =T)
+m3B_eigenvectors <- SpatialFiltering(HCAGONHLND ~ SPEI03_Mean, data = B, nb=nbB, style="W", zero.policy =T)
+
+m1A <-lm(HCAGONHLND~SPEI03_Minus05 + percentcrop + CNTRYNAMEE + fitted(m1A_eigenvectors), data = A)
+m2A <-lm(HCAGONHLND~SPEI03_Minus1 + percentcrop + CNTRYNAMEE + fitted(m2A_eigenvectors), data = A)
+m3A <-lm(HCAGONHLND~SPEI03_Mean + percentcrop + CNTRYNAMEE + fitted(m3A_eigenvectors), data = A)
+
+m1B <-lm(HCAGONHLND~SPEI03_Minus05 + percentcrop + CNTRYNAMEE + fitted(m1B_eigenvectors), data = B)
+m2B <-lm(HCAGONHLND~SPEI03_Minus1 + percentcrop + CNTRYNAMEE + fitted(m2B_eigenvectors), data = B)
+m3B <-lm(HCAGONHLND~SPEI03_Mean + percentcrop + CNTRYNAMEE + fitted(m3B_eigenvectors), data = B)
+
+#Make table panel A
+
+htmlreg(list(m1A, m2A, m3A),
+        file = "./model_results/ts2_A.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1A","Model 2A","Model 3A"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2", 
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Spatial filter model of effects of growing season SPEI03 during preceding five-year period. (Full Sample.)",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+#Make table panel B
+
+htmlreg(list(m1B, m2B, m3B),
+        file = "./model_results/ts2_B.html",
+        omit.coef=c('(CNTRY)|(SVYYEAR)'),
+        custom.model.names = c("Model 1B","Model 2B","Model 3B"),
+        custom.coef.map = list("(Intercept)" = "(Intercept)", "percentcrop2" = "percentcrop2", 
+                               "SPEI03_Minus05" = "SPEI103_Minus05","SPEI03_Minus1" = "SPEI03_Minus1",  
+                               "SPEI03_Mean" = "SPEI03_Mean"),
+        caption = "Spatial filter model of effects of growing season SPEI03 during preceding five-year period. 15 countries.",
+        single.row = T, 
+        inline.css = FALSE,
+        doctype = TRUE,
+        html.tag = TRUE,
+        head.tag = TRUE,
+        body.tag = TRUE)
+
+```
