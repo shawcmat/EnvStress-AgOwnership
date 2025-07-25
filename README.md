@@ -1,6 +1,8 @@
 # EnvStress-AgOwnership
 
-A Bayesian spatial regression exploring the effects of environmental stress on levels of agricultural landownership in affected regions. If you would only like to reproduce the analysis, use the provided R data object. If you wish to reproduce the dataset, follow the instructions below.
+[The effects of environmental stress on global agricultural landownership](https://link.springer.com/article/10.1007/s11111-023-00429-0)
+
+A Bayesian spatial regression exploring the effects of environmental stress on levels of agricultural landownership in affected regions. Published in Population and Environment. If you would only like to reproduce the analysis, use the provided R data object. If you wish to reproduce the dataset, follow the instructions below.
 
 ## Reproducing the Dataset
 
